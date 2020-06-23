@@ -8,7 +8,10 @@
 
 # required libraries
 library(tidyverse)
-
+library(tidymodels)
+library(ranger)
+library(themis)
+library(precrec)
 
 # Theme_set for plots
 theme_set(sjPlot::theme_sjplot())
@@ -144,7 +147,6 @@ loan_df <- loan_df %>%
 
 # Recode (NA values)
 loan_df$flag_fthb[loan_df$flag_fthb == "9"] <- NA
-loan_df$flag_fthb <- as.factor(loan_df$flag_fthb)
 loan_df$cnt_units[loan_df$cnt_units == 99] <- NA
 loan_df$occpy_sts[loan_df$occpy_sts == "9"] <- NA
 loan_df$occpy_sts <- as.factor(loan_df$occpy_sts)
@@ -154,7 +156,8 @@ loan_df$cnt_borr[loan_df$cnt_borr == "99"] <- NA
 loan_df$cnt_borr <- as.factor(loan_df$cnt_borr)
 
 loan_df <- loan_df %>% 
-  mutate(mi = if_else(mi_pct == "000", 0, 1))
+  mutate(mi = if_else(mi_pct == "000", 0, 1),
+         flag_fthb = if_else(flag_fthb == "Y", 1, 0))
 
 loan_df$mi_pct[loan_df$mi_pct == "999" | loan_df$mi_pct == "000"] <- NA
 loan_df$mi_pct <- as.numeric(loan_df$mi_pct)
@@ -162,15 +165,21 @@ loan_df$cltv[loan_df$cltv == 999] <- NA
 loan_df$prop_type <- as.factor(loan_df$prop_type)
 
 # Filter for interesting variables
-log_df <- loan_df %>% 
+reg_df <- loan_df %>% 
   select(fico, flag_fthb, cnt_units, occpy_sts, dti, int_rt, 
-         ppmt_pnlty, cnt_borr, mi, cltv, prop_type, target)
+         ppmt_pnlty, cnt_borr, mi, cltv, prop_type, target) 
 
-logit_model <- glm(target ~ . , data = log_df, family = binomial(link="logit"))
+# Create dummy variables
+reg_df <- fastDummies::dummy_cols(reg_df) %>% 
+  select(-occpy_sts, -ppmt_pnlty, -cnt_borr, -prop_type) %>% 
+  mutate(target = as.factor(target))
+
+logit_model <- glm(target ~ . , data = reg_df, family = binomial(link="logit"))
 
 summary(logit_model)
 
-log_df %>% filter(prop_type == "MH") %>% view()
+reg_df %>% filter(prop_type == "MH") %>% view()
+# 15% (15/149) of manufactured housing mortgages (MH) are defaulted
 
 # Interestingly the fico value (credit score is not significant)
 # Significant variables (p<0.05): 
@@ -182,6 +191,168 @@ log_df %>% filter(prop_type == "MH") %>% view()
 # Split in train and test set, 
 # continue to evaluate the model
 # use different machine learning algorithms (especially for highly unbalanced datasets)
+
+#------------------------ ML Part ----------------------------------------
+#
+# Split dataset into train and test set
+
+set.seed(1234)
+# split the data into trainng (75%) and testing (25%)
+reg_df_split <- initial_split(reg_df, prop = 3/4)
+
+# extract training and testing sets
+reg_train <- training(reg_df_split)
+reg_test <- testing(reg_df_split)
+
+# create CV (cross validation) object from training data
+reg_cv <- vfold_cv(reg_train)
+
+# define the recipe
+ml_recipe <- 
+  # which consists of the formula (outcome ~ predictors)
+  recipe(target ~ . , data = reg_df) %>%
+  # and some pre-processing steps
+  step_normalize(all_numeric()) %>%  # normalize the variables
+  step_knnimpute(all_predictors()) %>% # use k nearest neighbour imputation
+  step_smote(target, over_ratio = 0.2) %>% # Synthetic Minority Over-sampling Technique (smote)
+  prep()
+
+#--------------------------- Random Forest model ---------------------------------
+
+rf_model <- 
+  # specify that the model is a random forest
+  rand_forest() %>%
+  # specify that the `mtry` parameter needs to be tuned
+  set_args(mtry = tune()) %>%
+  # select the engine/package that underlies the model
+  set_engine("ranger", importance = "impurity") %>%
+  # choose either the continuous regression or binary classification mode
+  set_mode("classification") 
+
+
+# set the workflow
+rf_workflow <- workflow() %>%
+  # add the recipe
+  add_recipe(ml_recipe) %>%
+  # add the model
+  add_model(rf_model)
+
+
+# specify which values meant to try
+rf_grid <- expand.grid(mtry = c(2, 3, 4))
+# extract results
+rf_tune_results <- rf_workflow %>%
+  tune_grid(resamples = reg_cv, #CV object
+            grid = rf_grid, # grid of values to try
+            metrics = metric_set(accuracy, roc_auc)) # metrics we care about
+  
+# print results
+rf_tune_results %>%
+  collect_metrics()
+
+param_final <- rf_tune_results %>%
+  select_best(metric = "roc_auc")
+# mtry = 3 yields the best results
+
+# Add this parameter to the workflow
+rf_workflow <- rf_workflow %>%
+  finalize_workflow(param_final)
+
+rf_fit <- rf_workflow %>%
+  # fit on the training set and evaluate on test set
+  last_fit(reg_df_split)
+
+test_performance <- rf_fit %>% collect_metrics()
+test_performance
+
+# generate predictions from the test set
+test_predictions <- rf_fit %>% collect_predictions()
+test_predictions
+
+# generate a confusion matrix
+rf_conf_mat <- test_predictions %>% 
+  conf_mat(truth = target, estimate = .pred_class)
+# quite bad...
+summary(rf_conf_mat)
+
+test_predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = target), 
+               alpha = 0.5)
+# low probabilities for defaulted mortgages (target = 1)
+
+final_model <- fit(rf_workflow, reg_df)
+
+ranger_obj <- pull_workflow_fit(final_model)$fit
+ranger_obj
+
+ranger_obj$variable.importance
+
+#---------------------- logistic regression model --------------------------
+
+# Define the model
+lr_model <- 
+  # specify that the model is a logistic regression
+  logistic_reg() %>%
+  # select the engine/package that underlies the model
+  set_engine("glm") %>%
+  # choose either the continuous regression or binary classification mode
+  set_mode("classification")
+
+# set the logistic regression workflow
+lr_workflow <- workflow() %>%
+  # add the recipe
+  add_recipe(ml_recipe) %>%
+  # add the model
+  add_model(lr_model)
+
+lr_fit <- lr_workflow %>%
+  # fit on the training set and evaluate on test set
+  last_fit(reg_df_split)
+
+lr_test_performance <- lr_fit %>% collect_metrics()
+lr_test_performance
+
+# generate predictions from the test set
+lr_test_predictions <- lr_fit %>% collect_predictions()
+lr_test_predictions
+
+# generate a confusion matrix
+lr_conf_mat <- lr_test_predictions %>% 
+  conf_mat(truth = target, estimate = .pred_class)
+# again more or less the same picture: bad specificity
+summary(lr_conf_mat)
+
+lr_test_predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = target), 
+               alpha = 0.5)
+
+# The themis package offers further options of down or upsampling
+
+# Plot the roc curves
+# for logistic regression
+roc_logistic <- evalmod(scores = as.numeric(lr_test_predictions$.pred_class),
+                        labels = lr_test_predictions$target)
+autoplot(roc_logistic)
+
+# for random forest model
+roc_forest <- evalmod(scores = as.numeric(test_predictions$.pred_class),
+                        labels = test_predictions$target)
+autoplot(roc_forest)
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
