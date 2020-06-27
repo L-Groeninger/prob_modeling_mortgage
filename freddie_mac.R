@@ -345,6 +345,7 @@ rf_conf_mat <- test_predictions %>%
 # quite bad...
 summary(rf_conf_mat)
 
+
 test_predictions %>%
   ggplot() +
   geom_density(aes(x = .pred_1, fill = target), 
@@ -411,7 +412,7 @@ roc_forest <- evalmod(scores = as.numeric(test_predictions$.pred_class_2),
 autoplot(roc_forest)
 
 
-save.image(file='upsampling_session.RData')
+# save.image(file='upsampling_session.RData')
 
 
 
