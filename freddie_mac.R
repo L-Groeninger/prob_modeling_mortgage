@@ -12,9 +12,13 @@ library(tidymodels)
 library(ranger)
 library(themis)
 library(precrec)
+library(rstanarm)
+library(DMwR)
+library(bayesplot)
+library(rstan)
 
 # Theme_set for plots
-theme_set(sjPlot::theme_sjplot())
+theme_set(bayesplot::theme_default(base_family = "sans"))
 
 #------------------------------Reading in the sample data ---------------------------
 # It is divided into an origination file and a performance file
@@ -192,11 +196,73 @@ reg_df %>% filter(prop_type == "MH") %>% view()
 # continue to evaluate the model
 # use different machine learning algorithms (especially for highly unbalanced datasets)
 
+#------------------------- Bayesian logistic regression ----------------------
+#
+# Bayesian logistic regression with rstanarm
+
+target <- reg_df$target
+
+reg_df$target <- NULL
+reg_df$ppmt_pnlty_NA <- NULL 
+reg_df$cnt_borr_NA <- NULL
+
+for (i in 1:ncol(reg_df)) {
+  reg_df[i] <- scale(reg_df[i])
+}
+
+reg_df$target <- target
+
+# Test the stan_glm with a smaller undersampled dataframe
+balanced_df <- RandUnderClassif(target ~ . , as.data.frame(reg_df), "balance")
+
+# The dataset is extremely unbalanced
+table(reg_df$target)
+table(balanced_df$target)
+
+y <- balanced_df %>% 
+  drop_na() %>% 
+  pull(target)
+
+
+# Specify the model using uninformative priors
+model_1 <- stan_glm(target ~ ., data = balanced_df,
+                  family = binomial(link = "logit"), 
+                  prior = normal(0,1), prior_intercept = normal(0,1))
+
+stan_trace(model_1, pars = names(model_1$coefficients))
+posterior <- as.matrix(model_1)
+
+plot_title <- ggtitle("Posterior distributions",
+                      "with medians and 90% intervals")
+
+bayesplot::mcmc_areas(posterior,
+           prob = 0.9) + plot_title
+
+summary(model_1)
+
+round(coef(model_1), 2)
+round(posterior_interval(model_1, prob = 0.9), 2)
+
+# Predicted probabilities
+linpred <- posterior_linpred(model_1)
+preds <- posterior_linpred(model_1, transform=TRUE)
+pred <- colMeans(preds)
+pr <- as.integer(pred >= 0.5)
+
+# posterior classification accuracy
+round(mean(xor(pr,as.integer(y==0))),2)
+
+# 69% were classified correctly
+
+
 #------------------------ ML Part ----------------------------------------
 #
 # Split dataset into train and test set
 
-set.seed(1234)
+# For shorter calculations I use a fraction of the sample
+#reg_df <- sample_frac(reg_df, 0.2)
+
+set.seed(12345)
 # split the data into trainng (75%) and testing (25%)
 reg_df_split <- initial_split(reg_df, prop = 3/4)
 
@@ -214,7 +280,9 @@ ml_recipe <-
   # and some pre-processing steps
   step_normalize(all_numeric()) %>%  # normalize the variables
   step_knnimpute(all_predictors()) %>% # use k nearest neighbour imputation
-  step_smote(target, over_ratio = 0.2) %>% # Synthetic Minority Over-sampling Technique (smote)
+  step_smote(target, over_ratio = 0.3) %>% # Synthetic Minority Over-sampling Technique (smote)
+  #step_nearmiss(target, under_ratio = 5) %>% # Under sampling
+  #step_rose(target, over_ratio = 0.3) %>% 
   prep()
 
 #--------------------------- Random Forest model ---------------------------------
@@ -225,7 +293,7 @@ rf_model <-
   # specify that the `mtry` parameter needs to be tuned
   set_args(mtry = tune()) %>%
   # select the engine/package that underlies the model
-  set_engine("ranger", importance = "impurity") %>%
+  set_engine("ranger", importance = "impurity_corrected") %>%
   # choose either the continuous regression or binary classification mode
   set_mode("classification") 
 
@@ -251,8 +319,8 @@ rf_tune_results %>%
   collect_metrics()
 
 param_final <- rf_tune_results %>%
-  select_best(metric = "roc_auc")
-# mtry = 3 yields the best results
+  select_best(metric = "accuracy")
+# mtry = 2 yields the best results
 
 # Add this parameter to the workflow
 rf_workflow <- rf_workflow %>%
@@ -267,11 +335,13 @@ test_performance
 
 # generate predictions from the test set
 test_predictions <- rf_fit %>% collect_predictions()
-test_predictions
+# Change the probability threshold
+test_predictions <- test_predictions %>% 
+  mutate(.pred_class_2 = as.factor(if_else(.pred_1 >= 0.3, "1", "0")))
 
 # generate a confusion matrix
 rf_conf_mat <- test_predictions %>% 
-  conf_mat(truth = target, estimate = .pred_class)
+  conf_mat(truth = target, estimate = .pred_class_2)
 # quite bad...
 summary(rf_conf_mat)
 
@@ -315,11 +385,12 @@ lr_test_performance
 
 # generate predictions from the test set
 lr_test_predictions <- lr_fit %>% collect_predictions()
-lr_test_predictions
+lr_test_predictions <- lr_test_predictions %>% 
+  mutate(.pred_class_2 = as.factor(if_else(.pred_1 >= 0.3, "1", "0")))
 
 # generate a confusion matrix
 lr_conf_mat <- lr_test_predictions %>% 
-  conf_mat(truth = target, estimate = .pred_class)
+  conf_mat(truth = target, estimate = .pred_class_2)
 # again more or less the same picture: bad specificity
 summary(lr_conf_mat)
 
@@ -328,21 +399,19 @@ lr_test_predictions %>%
   geom_density(aes(x = .pred_1, fill = target), 
                alpha = 0.5)
 
-# The themis package offers further options of down or upsampling
-
 # Plot the roc curves
 # for logistic regression
-roc_logistic <- evalmod(scores = as.numeric(lr_test_predictions$.pred_class),
+roc_logistic <- evalmod(scores = as.numeric(lr_test_predictions$.pred_class_2),
                         labels = lr_test_predictions$target)
 autoplot(roc_logistic)
 
 # for random forest model
-roc_forest <- evalmod(scores = as.numeric(test_predictions$.pred_class),
+roc_forest <- evalmod(scores = as.numeric(test_predictions$.pred_class_2),
                         labels = test_predictions$target)
 autoplot(roc_forest)
 
 
-
+save.image(file='upsampling_session.RData')
 
 
 
