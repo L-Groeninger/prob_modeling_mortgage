@@ -79,3 +79,24 @@ loan_df <- orig_df %>%
 # remove the datasets which are not necessary
 rm(svcgdata)
 rm(orig_df)
+
+# Recode (NA values)
+loan_df$fico[loan_df$fico == 9999] <- NA
+loan_df$flag_fthb[loan_df$flag_fthb == "9"] <- NA
+loan_df$cnt_units[loan_df$cnt_units == 99] <- NA
+loan_df$occpy_sts[loan_df$occpy_sts == "9"] <- NA
+loan_df$occpy_sts <- as.factor(loan_df$occpy_sts)
+loan_df$dti[loan_df$dti == 999] <- NA
+loan_df$ppmt_pnlty <- as.factor(loan_df$ppmt_pnlty)
+loan_df$cnt_borr[loan_df$cnt_borr == "99"] <- NA
+loan_df$cnt_borr <- as.factor(loan_df$cnt_borr)
+
+loan_df <- loan_df %>% 
+  mutate(mi = if_else(mi_pct == "000", 0, 1),
+         flag_fthb = if_else(flag_fthb == "Y", 1, 0))
+
+loan_df$mi_pct[loan_df$mi_pct == "999" | loan_df$mi_pct == "000"] <- NA
+loan_df$mi_pct <- as.numeric(loan_df$mi_pct)
+loan_df$cltv[loan_df$cltv == 999] <- NA
+loan_df$prop_type <- as.factor(loan_df$prop_type)
+

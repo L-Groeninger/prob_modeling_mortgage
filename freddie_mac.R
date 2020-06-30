@@ -20,77 +20,8 @@ library(rstan)
 # Theme_set for plots
 theme_set(bayesplot::theme_default(base_family = "sans"))
 
-#------------------------------Reading in the sample data ---------------------------
-# It is divided into an origination file and a performance file
-colnames_orig <- c(
-  'fico','dt_first_pi','flag_fthb','dt_matr','cd_msa','mi_pct','cnt_units','occpy_sts','cltv',
-  'dti','orig_upb','ltv','int_rt','channel','ppmt_pnlty','prod_type','st','prop_type','zipcode','id_loan',
-  'loan_purpose','orig_loan_term','cnt_borr','seller_name','servicer_name','flag_sc')
-
-orig_df <- read_delim("sample_orig_1999.txt", delim = "|", col_names = colnames_orig)
-
-#------------------------- performance file 
-svcgclass <- c(
-  'character','integer','real','character','integer','integer','character','character','character',
-  'integer','real','real','integer','integer','character','integer','integer','integer','integer',
-  'integer','integer','real','real','character','character','real','real','real')
-
-readfile_svcg <- function(filenm){read.table(filenm,sep="|", header=FALSE, colClasses=svcgclass)}
-
-file_list_svcg <- list.files(path=getwd(), pattern=c("sample_svcg_1999",".txt"), full.names=F)
-
-svcgdata <- do.call("rbind", lapply(file_list_svcg,readfile_svcg))
-
-names(svcgdata) <- c(
-  'id_loan','svcg_cycle','current_upb','delq_sts','loan_age','mths_remng','repch_flag','flag_mod','cd_zero_bal',
-  'dt_zero_bal','current_int_rt','non_int_brng_upb','dt_lst_pi','mi_recoveries','net_sale_proceeds',
-  'non_mi_recoveries','expenses','legal_costs','maint_pres_costs','taxes_ins_costs','misc_costs','actual_loss',
-  'modcost','stepmod_ind','dpm_ind','eltv','zb_removal_upb','dlq_acrd_int')
-
-########
-
-# Okay, step by step
-# Which loans are considered prepaid or defaulted or still active?
-
-# prepaid = zero_balance = 01 and repurchase = "N"
-# default = zero_balance = 03, 06, 09
-# active = not classified as default or prepaid and latest reporting date for the loan
-#          is 201906 (latest possible date) and delinquincy is 
-#          not equal to R at the latest date
-
-perf_df <- select(svcgdata, 1:11, 27:28) %>% 
-  mutate(prepaid = if_else((cd_zero_bal == "01" & repch_flag == "N"), TRUE, FALSE),
-         default = if_else((cd_zero_bal == "03" | cd_zero_bal == "06" |
-                              cd_zero_bal == "09"), TRUE, FALSE),
-         active = if_else((prepaid == FALSE & default == FALSE & 
-                             svcg_cycle == 201906 & delq_sts != "R"), TRUE, FALSE))
-
-# How many of the loans are defaulted/prepaid/active?
-perf_df %>% filter(default == TRUE) %>% distinct(id_loan) %>% nrow() # 698
-perf_df %>% filter(prepaid == TRUE) %>% distinct(id_loan) %>% nrow() # 48478
-perf_df %>% filter(active == TRUE) %>% distinct(id_loan) %>% nrow()  # 655
-
-# In our sample are: - 1.396% of loans defaulted (698/50000)
-#                    - 96.96% of loans prepaid (48478/50000)
-#                    - 1.31% of loans still active (655/50000)
-# This sums up to 99.666%
-# The rest of the loans has zero balance code 02 (third party sale) 
-# or 15 (Note sale/reperforming sale) 
-# We might remove these loans later on
-
-# Calculate the time of prepayment/default
-# Keep only the rows with the latest entry of the svcg_cycle
-last_perf <- perf_df %>% 
-  arrange(desc(svcg_cycle)) %>% 
-  distinct(id_loan, .keep_all = TRUE) 
-
-last_perf %>% filter(active == FALSE & default == FALSE & prepaid == FALSE) # %>% view() # 169
-
-loan_df <- orig_df %>% 
-  inner_join(last_perf) %>% 
-  mutate(loan_start = as.numeric(substr(as.character(dt_first_pi), 1, 4)),
-         loan_end = as.numeric(substr(as.character(svcg_cycle), 1, 4)),
-         loan_age_2 = loan_end - loan_start)
+# Read in the data
+source("read_in_data.R")
 
 # Reproduce the descriptive plot from the paper (p. 12)
 plot_data <- loan_df %>% 
@@ -149,40 +80,20 @@ loan_df <- loan_df %>%
 
 # So it is either prepaid or defaulted
 
-# Recode (NA values)
-loan_df$flag_fthb[loan_df$flag_fthb == "9"] <- NA
-loan_df$cnt_units[loan_df$cnt_units == 99] <- NA
-loan_df$occpy_sts[loan_df$occpy_sts == "9"] <- NA
-loan_df$occpy_sts <- as.factor(loan_df$occpy_sts)
-loan_df$dti[loan_df$dti == 999] <- NA
-loan_df$ppmt_pnlty <- as.factor(loan_df$ppmt_pnlty)
-loan_df$cnt_borr[loan_df$cnt_borr == "99"] <- NA
-loan_df$cnt_borr <- as.factor(loan_df$cnt_borr)
-
-loan_df <- loan_df %>% 
-  mutate(mi = if_else(mi_pct == "000", 0, 1),
-         flag_fthb = if_else(flag_fthb == "Y", 1, 0))
-
-loan_df$mi_pct[loan_df$mi_pct == "999" | loan_df$mi_pct == "000"] <- NA
-loan_df$mi_pct <- as.numeric(loan_df$mi_pct)
-loan_df$cltv[loan_df$cltv == 999] <- NA
-loan_df$prop_type <- as.factor(loan_df$prop_type)
-
 # Filter for interesting variables
 reg_df <- loan_df %>% 
-  select(fico, flag_fthb, cnt_units, occpy_sts, dti, int_rt, 
-         ppmt_pnlty, cnt_borr, mi, cltv, prop_type, target) 
+  select(fico, flag_fthb, cnt_units, occpy_sts, dti, int_rt, mi, cltv, prop_type, target) 
 
 # Create dummy variables
 reg_df <- fastDummies::dummy_cols(reg_df) %>% 
-  select(-occpy_sts, -ppmt_pnlty, -cnt_borr, -prop_type) %>% 
+  select(-occpy_sts, -prop_type) %>% 
   mutate(target = as.factor(target))
 
 logit_model <- glm(target ~ . , data = reg_df, family = binomial(link="logit"))
 
 summary(logit_model)
 
-reg_df %>% filter(prop_type == "MH") %>% view()
+# reg_df %>% filter(prop_type == "MH") %>% view()
 # 15% (15/149) of manufactured housing mortgages (MH) are defaulted
 
 # Interestingly the fico value (credit score is not significant)
@@ -200,6 +111,8 @@ reg_df %>% filter(prop_type == "MH") %>% view()
 #
 # Bayesian logistic regression with rstanarm
 
+reg_df <- reg_df %>% drop_na()
+
 target <- reg_df$target
 
 reg_df$target <- NULL
@@ -213,16 +126,13 @@ for (i in 1:ncol(reg_df)) {
 reg_df$target <- target
 
 # Test the stan_glm with a smaller undersampled dataframe
-balanced_df <- RandUnderClassif(target ~ . , as.data.frame(reg_df), "balance")
+balanced_df <- UBL::RandUnderClassif(target ~ . , as.data.frame(reg_df), "balance")
 
 # The dataset is extremely unbalanced
 table(reg_df$target)
 table(balanced_df$target)
 
-y <- balanced_df %>% 
-  drop_na() %>% 
-  pull(target)
-
+y <- as.numeric(balanced_df$target) - 1
 
 # Specify the model using uninformative priors
 model_1 <- stan_glm(target ~ ., data = balanced_df,
@@ -232,16 +142,18 @@ model_1 <- stan_glm(target ~ ., data = balanced_df,
 stan_trace(model_1, pars = names(model_1$coefficients))
 posterior <- as.matrix(model_1)
 
-plot_title <- ggtitle("Posterior distributions",
-                      "with medians and 90% intervals")
-
-bayesplot::mcmc_areas(posterior,
-           prob = 0.9) + plot_title
-
 summary(model_1)
 
 round(coef(model_1), 2)
 round(posterior_interval(model_1, prob = 0.9), 2)
+
+p <- plot(model_1, pars = names(model_1$coefficients),
+          prob = 0.5, prob_outer = 0.9)
+p + ggplot2::ggtitle("Posterior medians \n with 50% and 90% intervals")
+
+bayesplot::color_scheme_set("red")
+plot(model_1, "acf", pars = names(model_1$coefficients))
+
 
 # Predicted probabilities
 linpred <- posterior_linpred(model_1)
@@ -252,15 +164,21 @@ pr <- as.integer(pred >= 0.5)
 # posterior classification accuracy
 round(mean(xor(pr,as.integer(y==0))),2)
 
-# 69% were classified correctly
+# 73% were classified correctly
 
 
 #------------------------ ML Part ----------------------------------------
 #
 # Split dataset into train and test set
 
-# For shorter calculations I use a fraction of the sample
-#reg_df <- sample_frac(reg_df, 0.2)
+# Prepare the dataframe (with NA's)
+reg_df <- loan_df %>% 
+  select(fico, flag_fthb, cnt_units, occpy_sts, dti, int_rt, mi, cltv, prop_type, target) 
+
+# Create dummy variables
+reg_df <- fastDummies::dummy_cols(reg_df) %>% 
+  select(-occpy_sts, -prop_type) %>% 
+  mutate(target = as.factor(target))
 
 set.seed(12345)
 # split the data into trainng (75%) and testing (25%)
@@ -345,6 +263,7 @@ rf_conf_mat <- test_predictions %>%
 # quite bad...
 summary(rf_conf_mat)
 
+ggplot2::autoplot(rf_conf_mat, type = "heatmap")
 
 test_predictions %>%
   ggplot() +
@@ -410,7 +329,6 @@ autoplot(roc_logistic)
 roc_forest <- evalmod(scores = as.numeric(test_predictions$.pred_class_2),
                         labels = test_predictions$target)
 autoplot(roc_forest)
-
 
 # save.image(file='upsampling_session.RData')
 
